@@ -8,12 +8,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
 	"github.com/zeebo/errs"
 
 	"storj.io/common/storj"
+	"storj.io/storj/private/dbutil"
 	"storj.io/storj/private/dbutil/pgutil"
 	"storj.io/storj/private/tagsql"
 	"storj.io/storj/satellite/gracefulexit"
@@ -83,25 +85,50 @@ func (db *gracefulexitDB) Enqueue(ctx context.Context, items []gracefulexit.Tran
 		return compare < 0
 	})
 
-	var nodeIDs []storj.NodeID
-	var keys [][]byte
-	var pieceNums []int32
-	var rootPieceIDs [][]byte
-	var durabilities []float64
-	for _, item := range items {
-		nodeIDs = append(nodeIDs, item.NodeID)
-		keys = append(keys, item.Key)
-		pieceNums = append(pieceNums, item.PieceNum)
-		rootPieceIDs = append(rootPieceIDs, item.RootPieceID.Bytes())
-		durabilities = append(durabilities, item.DurabilityRatio)
+	const crdbBatch = 1000
+
+	b, e := 0, len(items)
+	if db.db.implementation == dbutil.Cockroach {
+		if len(items) > crdbBatch {
+			e = crdbBatch
+		}
 	}
 
-	_, err = db.db.ExecContext(ctx, db.db.Rebind(`
+	for {
+		var nodeIDs []storj.NodeID
+		var keys [][]byte
+		var pieceNums []int32
+		var rootPieceIDs [][]byte
+		var durabilities []float64
+		for _, item := range items[b:e] {
+			nodeIDs = append(nodeIDs, item.NodeID)
+			keys = append(keys, item.Key)
+			pieceNums = append(pieceNums, item.PieceNum)
+			rootPieceIDs = append(rootPieceIDs, item.RootPieceID.Bytes())
+			durabilities = append(durabilities, item.DurabilityRatio)
+		}
+
+		_, err = db.db.ExecContext(ctx, db.db.Rebind(`
 			INSERT INTO graceful_exit_transfer_queue(node_id, path, piece_num, root_piece_id, durability_ratio, queued_at)
 			SELECT unnest($1::bytea[]), unnest($2::bytea[]), unnest($3::int4[]), unnest($4::bytea[]), unnest($5::float8[]), $6
 			ON CONFLICT DO NOTHING;`), pgutil.NodeIDArray(nodeIDs), pgutil.ByteaArray(keys), pgutil.Int4Array(pieceNums), pgutil.ByteaArray(rootPieceIDs), pgutil.Float8Array(durabilities), time.Now().UTC())
 
-	return Error.Wrap(err)
+		if err != nil {
+			return Error.Wrap(err)
+		}
+
+		if e < len(items) {
+			if a := e + crdbBatch; a < len(items) {
+				e = a
+			} else {
+				e = len(items)
+			}
+		} else {
+			break
+		}
+	}
+
+	return nil
 }
 
 // UpdateTransferQueueItem creates a graceful exit transfer queue entry.
@@ -160,27 +187,106 @@ func (db *gracefulexitDB) DeleteAllFinishedTransferQueueItems(
 	ctx context.Context, before time.Time) (_ int64, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	statement := db.db.Rebind(
-		`DELETE FROM graceful_exit_transfer_queue
-		WHERE node_id IN (
+	switch db.db.implementation {
+	case dbutil.Postgres:
+		statement := `
+			DELETE FROM graceful_exit_transfer_queue
+			WHERE node_id IN (
+				SELECT id
+				FROM nodes
+				WHERE exit_finished_at IS NOT NULL
+					AND exit_finished_at < $1
+			)`
+		res, err := db.db.ExecContext(ctx, statement, before)
+		if err != nil {
+			return 0, Error.Wrap(err)
+		}
+
+		count, err := res.RowsAffected()
+		if err != nil {
+			return 0, Error.Wrap(err)
+		}
+
+		return count, nil
+
+	case dbutil.Cockroach:
+		const batch = 1000
+
+		nodesQuery := fmt.Sprintf(`
 			SELECT id
-			FROM nodes
+			FROM nodes %s
 			WHERE exit_finished_at IS NOT NULL
-				AND exit_finished_at < ?
-		)`,
+				AND exit_finished_at < $1
+			LIMIT $2 OFFSET $3
+		`, db.db.AsOfSystemTimeClauseAt(time.Now().UTC()))
+		deleteStm := `
+			DELETE FROM graceful_exit_transfer_queue
+			WHERE node_id IN (
+				SELECT unnest($1::bytea[])
+			)
+			LIMIT $2
+		`
+		var (
+			deleteCount int64
+			offset      int
+		)
+		for {
+			nodeIDs := make([][]byte, 0)
+
+			// Select exited nodes
+			rows, err := db.db.QueryContext(ctx, nodesQuery, before, batch, offset)
+			if err != nil {
+				return deleteCount, Error.Wrap(err)
+			}
+
+			count := 0
+			for rows.Next() {
+				var id storj.NodeID
+				if err = rows.Scan(&id); err != nil {
+					return deleteCount, Error.Wrap(err)
+				}
+
+				nodeIDs = append(nodeIDs, id.Bytes())
+				count++
+			}
+
+			if count == batch {
+				offset += count
+			} else {
+				offset = -1 // indicates that there aren't more nodes to query
+			}
+
+			// Delete, in batch, the GE query items of those nodes
+			for {
+				res, err := db.db.ExecContext(ctx, deleteStm, pgutil.ByteaArray(nodeIDs), batch)
+				if err != nil {
+					return deleteCount, Error.Wrap(err)
+				}
+
+				count, err := res.RowsAffected()
+				if err != nil {
+					return deleteCount, Error.Wrap(err)
+				}
+
+				deleteCount += count
+				if count < batch {
+					break
+				}
+			}
+
+			// when offset is negative means that we have get already all the nodes
+			// which have exited
+			if offset < 0 {
+				break
+			}
+		}
+
+		return deleteCount, nil
+	}
+
+	return 0, Error.New("unsupported implementation: %s",
+		dbutil.SchemeForImplementation(db.db.implementation),
 	)
-
-	res, err := db.db.ExecContext(ctx, statement, before)
-	if err != nil {
-		return 0, Error.Wrap(err)
-	}
-
-	count, err := res.RowsAffected()
-	if err != nil {
-		return 0, Error.Wrap(err)
-	}
-
-	return count, nil
 }
 
 // GetTransferQueueItem gets a graceful exit transfer queue entry.
@@ -291,15 +397,23 @@ func (db *gracefulexitDB) IncrementOrderLimitSendCount(ctx context.Context, node
 func (db *gracefulexitDB) CountFinishedTransferQueueItemsByNode(ctx context.Context, before time.Time) (_ map[storj.NodeID]int64, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	statement := db.db.Rebind(
+	asOf := ""
+	if db.db.implementation == dbutil.Cockroach {
+		asOf = db.db.AsOfSystemTimeClauseAt(time.Now().UTC())
+	}
+
+	query := fmt.Sprintf(
 		`SELECT n.id, count(getq.node_id)
 		FROM nodes as n LEFT JOIN graceful_exit_transfer_queue as getq
-			ON n.id = getq.node_id
+			ON n.id = getq.node_id %s
 		WHERE n.exit_finished_at IS NOT NULL
 			AND n.exit_finished_at < ?
 		GROUP BY n.id
 		HAVING count(getq.node_id) > 0`,
+		asOf,
 	)
+
+	statement := db.db.Rebind(query)
 
 	rows, err := db.db.QueryContext(ctx, statement, before)
 	if err != nil {

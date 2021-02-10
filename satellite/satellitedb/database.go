@@ -168,6 +168,16 @@ func (db *satelliteDB) AsOfSystemTimeClause(interval time.Duration) (asOf string
 	return asOf
 }
 
+// AsOfSystemTimeClauseAt returns the "AS OF SYSTEM TIME" clause if the DB
+// implementation is CockroachDB and the time is less than time.Now().
+func (db *satelliteDB) AsOfSystemTimeClauseAt(t time.Time) string {
+	if db.implementation != dbutil.Cockroach || t.After(time.Now()) {
+		return ""
+	}
+
+	return " AS OF SYSTEM TIME '" + t.UTC().Format("2006-01-02 15:04:05") + "' "
+}
+
 // TestDBAccess for raw database access,
 // should not be used outside of migration tests.
 func (db *satelliteDB) TestDBAccess() *dbx.DB { return db.DB }
